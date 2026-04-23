@@ -15,53 +15,86 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 
-BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
-PAIRS_URL  = "https://api.dexscreener.com/latest/dex/tokens/{}"
+# Both endpoints — latest gives newest, active gives all currently running boosts
+BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+BOOSTS_ACTIVE_URL = "https://api.dexscreener.com/token-boosts/active/v1"
+PAIRS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
 
 seen_tokens: set[str] = set()
 
-# --- Rate limiter ---
+
 class RateLimiter:
-    """Sliding window rate limiter."""
     def __init__(self, max_calls: int, period: float):
         self.max_calls = max_calls
-        self.period = period      # seconds
+        self.period = period
         self.calls: deque = deque()
 
     def wait(self):
         now = time.monotonic()
-        # Drop calls outside the window
         while self.calls and now - self.calls[0] >= self.period:
             self.calls.popleft()
         if len(self.calls) >= self.max_calls:
             sleep_for = self.period - (now - self.calls[0])
             if sleep_for > 0:
-                logger.debug("Rate limit: sleeping %.2fs", sleep_for)
                 time.sleep(sleep_for)
         self.calls.append(time.monotonic())
 
-# 60 req/min for boosts, 300 req/min for pairs — use 80% of limit to be safe
-boosts_limiter = RateLimiter(max_calls=48, period=60)   # 80% of 60
-pairs_limiter  = RateLimiter(max_calls=240, period=60)  # 80% of 300
+
+boosts_limiter = RateLimiter(max_calls=48, period=60)
+pairs_limiter = RateLimiter(max_calls=240, period=60)
+
+
+def fetch_boosts(url: str) -> list[dict]:
+    boosts_limiter.wait()
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return data.get("data") or data.get("tokens") or []
+        return []
+    except Exception as e:
+        logger.error("Error fetching %s: %s", url, e)
+        return []
+
+
+def get_paid_eth_tokens() -> list[dict]:
+    """Fetch from both latest and active endpoints, deduplicate."""
+    latest = fetch_boosts(BOOSTS_LATEST_URL)
+    active = fetch_boosts(BOOSTS_ACTIVE_URL)
+
+    # Merge, deduplicate by tokenAddress
+    all_tokens: dict[str, dict] = {}
+    for t in active + latest:  # latest overwrites active so newest data wins
+        addr = t.get("tokenAddress", "")
+        if addr:
+            all_tokens[addr] = t
+
+    all_list = list(all_tokens.values())
+    chains = {t.get("chainId", "") for t in all_list}
+    logger.info("Combined: %d unique tokens across chains: %s", len(all_list), chains)
+
+    eth = [t for t in all_list if str(t.get("chainId", "")).lower() in ETH_CHAIN_IDS]
+    logger.info("ETH paid tokens: %d", len(eth))
+    return eth
 
 
 def get_token_market_data(token_address: str) -> dict:
     pairs_limiter.wait()
     try:
-        resp = requests.get(
-            PAIRS_URL.format(token_address),
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
+        resp = requests.get(PAIRS_URL.format(token_address), timeout=10,
+                            headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
         if not pairs:
             return {}
         return sorted(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0), reverse=True)[0]
     except Exception as e:
-        logger.warning("Market data fetch failed for %s: %s", token_address, e)
+        logger.warning("Market data failed for %s: %s", token_address, e)
         return {}
 
 
@@ -96,8 +129,7 @@ def fmt_pct(v) -> str:
         return "N/A"
     try:
         v = float(v)
-        icon = "🟢" if v >= 0 else "🔴"
-        return f"{icon} {v:+.1f}%"
+        return f"{'🟢' if v >= 0 else '🔴'} {v:+.1f}%"
     except Exception:
         return "N/A"
 
@@ -115,26 +147,24 @@ def time_ago(unix_ms) -> str:
 
 
 def format_alert(token: dict, market: dict) -> str:
-    addr      = token.get("tokenAddress", "")
-    chain     = token.get("chainId", "ethereum")
-    ds_url    = token.get("url", f"https://dexscreener.com/{chain}/{addr}")
-    desc      = token.get("description", "")
-    links     = token.get("links", [])
+    addr   = token.get("tokenAddress", "")
+    chain  = token.get("chainId", "ethereum")
+    ds_url = token.get("url", f"https://dexscreener.com/{chain}/{addr}")
+    desc   = token.get("description", "")
+    links  = token.get("links", [])
 
-    base  = market.get("baseToken", {})
-    name  = base.get("name") or desc[:30] or "Unknown"
-    sym   = base.get("symbol", "???")
+    base = market.get("baseToken", {})
+    name = base.get("name") or desc[:30] or "Unknown"
+    sym  = base.get("symbol", "???")
 
     dex        = (market.get("dexId") or "DEX").capitalize()
     created_at = market.get("pairCreatedAt")
     listed     = time_ago(created_at) if created_at else "N/A"
+    pc         = market.get("priceChange") or {}
 
-    pc = market.get("priceChange") or {}
-
-    # Socials
     site = tg = tw = None
     for lnk in links:
-        lt, lu = lnk.get("type","").lower(), lnk.get("url","")
+        lt, lu = lnk.get("type", "").lower(), lnk.get("url", "")
         if lt == "website"  and not site: site = lu
         if lt == "twitter"  and not tw:   tw   = lu
         if lt == "telegram" and not tg:   tg   = lu
@@ -194,37 +224,6 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def get_paid_eth_tokens() -> list[dict]:
-    boosts_limiter.wait()
-    try:
-        resp = requests.get(
-            BOOSTS_URL,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if isinstance(data, list):
-            all_tokens = data
-        elif isinstance(data, dict):
-            all_tokens = data.get("data") or data.get("tokens") or []
-        else:
-            logger.warning("Unexpected API format: %s", type(data))
-            return []
-
-        chains = {t.get("chainId","") for t in all_tokens}
-        logger.info("API returned %d tokens across chains: %s", len(all_tokens), chains)
-
-        eth = [t for t in all_tokens if str(t.get("chainId","")).lower() in ETH_CHAIN_IDS]
-        logger.info("ETH paid tokens: %d", len(eth))
-        return eth
-
-    except Exception as e:
-        logger.error("DexScreener fetch error: %s", e)
-        return []
-
-
 def check_and_alert():
     tokens = get_paid_eth_tokens()
     new_count = 0
@@ -239,14 +238,14 @@ def check_and_alert():
         message = format_alert(token, market)
 
         if send_telegram(message):
-            logger.info("✅ Sent alert: %s", addr)
+            logger.info("✅ Alert sent: %s", addr)
             new_count += 1
         else:
-            logger.warning("❌ Failed alert: %s", addr)
+            logger.warning("❌ Failed: %s", addr)
 
-        time.sleep(1)  # small buffer between Telegram messages
+        time.sleep(1)
 
-    logger.info("Cycle done — %d new alerts.", new_count)
+    logger.info("Cycle done — %d new alerts | %d total seen", new_count, len(seen_tokens))
 
 
 def main():
@@ -255,15 +254,15 @@ def main():
     send_telegram(
         f"🤖 *DexScreener ETH Paid Alerts — Live*\n\n"
         f"Monitoring Ethereum paid listings every {CHECK_INTERVAL}s\n"
-        f"Rate limits: 48 req/min (boosts) · 240 req/min (pairs)"
+        f"Watching both `/latest` and `/active` boost endpoints."
     )
 
-    # Seed without alerting
+    # Seed silently — no alerts for already-active boosts
     logger.info("Seeding existing tokens (silent)...")
     for t in get_paid_eth_tokens():
         if addr := t.get("tokenAddress"):
             seen_tokens.add(addr)
-    logger.info("Seeded %d tokens. Watching for new ones...", len(seen_tokens))
+    logger.info("Seeded %d tokens. Watching for NEW listings...", len(seen_tokens))
 
     while True:
         try:

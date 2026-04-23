@@ -1,9 +1,11 @@
 import os
-import time
+import asyncio
 import logging
+import json
+import time
 import requests
+import websockets
 from datetime import datetime, timezone
-from collections import deque
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,10 +15,9 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 
-# DEX PAID endpoint (token profiles = the green PAID badge)
-DEX_PAID_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+# Official DexScreener WebSocket — real-time token profiles (DEX PAID)
+WS_URL   = "wss://api.dexscreener.com/token-profiles/latest/v1"
 PAIRS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
@@ -24,59 +25,9 @@ ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
 seen_tokens: set[str] = set()
 
 
-class RateLimiter:
-    def __init__(self, max_calls: int, period: float):
-        self.max_calls = max_calls
-        self.period = period
-        self.calls: deque = deque()
-
-    def wait(self):
-        now = time.monotonic()
-        while self.calls and now - self.calls[0] >= self.period:
-            self.calls.popleft()
-        if len(self.calls) >= self.max_calls:
-            sleep_for = self.period - (now - self.calls[0])
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-        self.calls.append(time.monotonic())
-
-
-profiles_limiter = RateLimiter(max_calls=48, period=60)
-pairs_limiter = RateLimiter(max_calls=240, period=60)
-
-
-def get_dex_paid_eth_tokens() -> list[dict]:
-    profiles_limiter.wait()
-    try:
-        resp = requests.get(
-            DEX_PAID_URL, timeout=15,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if isinstance(data, list):
-            all_tokens = data
-        elif isinstance(data, dict):
-            all_tokens = data.get("data") or data.get("tokens") or []
-        else:
-            logger.warning("Unexpected format: %s", type(data))
-            return []
-
-        chains = {t.get("chainId", "") for t in all_tokens}
-        logger.info("DEX PAID: %d tokens across chains: %s", len(all_tokens), chains)
-
-        eth = [t for t in all_tokens if str(t.get("chainId", "")).lower() in ETH_CHAIN_IDS]
-        logger.info("ETH DEX PAID tokens: %d", len(eth))
-        return eth
-
-    except Exception as e:
-        logger.error("Error fetching DEX PAID: %s", e)
-        return []
-
+# ── Market data ────────────────────────────────────────────────────────────────
 
 def get_token_market_data(token_address: str) -> dict:
-    pairs_limiter.wait()
     try:
         resp = requests.get(
             PAIRS_URL.format(token_address), timeout=10,
@@ -92,35 +43,31 @@ def get_token_market_data(token_address: str) -> dict:
         return {}
 
 
+# ── Formatters ─────────────────────────────────────────────────────────────────
+
 def fmt_number(value) -> str:
     try:
         v = float(value)
     except (TypeError, ValueError):
         return "N/A"
-    if v >= 1_000_000_000:
-        return f"${v/1_000_000_000:.2f}B"
-    if v >= 1_000_000:
-        return f"${v/1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"${v/1_000:.2f}K"
+    if v >= 1_000_000_000: return f"${v/1_000_000_000:.2f}B"
+    if v >= 1_000_000:     return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:         return f"${v/1_000:.2f}K"
     return f"${v:.2f}"
 
 
 def fmt_price(value) -> str:
     try:
         v = float(value)
-        if v < 0.000001:
-            return f"${v:.10f}"
-        if v < 0.01:
-            return f"${v:.6f}"
+        if v < 0.000001: return f"${v:.10f}"
+        if v < 0.01:     return f"${v:.6f}"
         return f"${v:.4f}"
     except (TypeError, ValueError):
         return "N/A"
 
 
 def fmt_pct(v) -> str:
-    if v is None:
-        return "N/A"
+    if v is None: return "N/A"
     try:
         v = float(v)
         return f"{'🟢' if v >= 0 else '🔴'} {v:+.1f}%"
@@ -131,14 +78,18 @@ def fmt_pct(v) -> str:
 def time_ago(unix_ms) -> str:
     try:
         diff = datetime.now(timezone.utc).timestamp() - (unix_ms / 1000)
-        if diff < 60:
-            return f"{int(diff)}s ago"
-        if diff < 3600:
-            return f"{int(diff//60)}' {int(diff%60)}s ago"
-        return f"{int(diff//3600)}h {int((diff%3600)//60)}m ago"
+        if diff < 60:   return f"{int(diff)}s ago"
+        if diff < 3600: return f"{int(diff//60)}' {int(diff%60)}s ago"
+        h = int(diff // 3600)
+        if h < 24*30:   return f"{h}h {int((diff%3600)//60)}m ago"
+        days = int(diff // 86400)
+        if days < 365:  return f"{days}d ago"
+        return f"{int(days//365)}y ago"
     except Exception:
         return "recently"
 
+
+# ── Alert formatter ────────────────────────────────────────────────────────────
 
 def format_alert(token: dict, market: dict) -> str:
     addr   = token.get("tokenAddress", "")
@@ -169,7 +120,7 @@ def format_alert(token: dict, market: dict) -> str:
         "",
         "⏰ *DEX Time*",
         f"└ {dex} • {listed}",
-        f"└ [DexScreener]({ds_url}) ✅ *DEX PAID*",
+        f"└ [DexScreener]({ds_url}) 🟢 *PAID*",
         "",
     ]
 
@@ -197,6 +148,8 @@ def format_alert(token: dict, market: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Telegram ───────────────────────────────────────────────────────────────────
+
 def send_telegram(text: str) -> bool:
     try:
         resp = requests.post(
@@ -213,57 +166,116 @@ def send_telegram(text: str) -> bool:
             logger.error("Telegram %s: %s", resp.status_code, resp.text[:200])
             return False
         return True
-    except requests.RequestException as e:
+    except Exception as e:
         logger.error("Telegram send failed: %s", e)
         return False
 
 
-def check_and_alert():
-    tokens = get_dex_paid_eth_tokens()
-    new_count = 0
+# ── Token handler ──────────────────────────────────────────────────────────────
 
-    for token in tokens:
-        addr = token.get("tokenAddress", "")
-        if not addr or addr in seen_tokens:
-            continue
+def handle_token(token: dict):
+    addr  = token.get("tokenAddress", "")
+    chain = str(token.get("chainId", "")).lower()
 
-        seen_tokens.add(addr)
-        market  = get_token_market_data(addr)
-        message = format_alert(token, market)
+    if not addr or chain not in ETH_CHAIN_IDS:
+        return
 
-        if send_telegram(message):
-            logger.info("✅ Alert sent: %s", addr)
-            new_count += 1
-        else:
-            logger.warning("❌ Failed: %s", addr)
+    if addr in seen_tokens:
+        return
 
-        time.sleep(1)
+    seen_tokens.add(addr)
+    logger.info("🆕 New ETH DEX PAID: %s", addr)
 
-    logger.info("Cycle done — %d new alerts | %d total seen", new_count, len(seen_tokens))
+    market  = get_token_market_data(addr)
+    message = format_alert(token, market)
+
+    if send_telegram(message):
+        logger.info("✅ Alert sent: %s", addr)
+    else:
+        logger.warning("❌ Failed to send alert: %s", addr)
 
 
-def main():
-    logger.info("Starting | channel=%s interval=%ds", TELEGRAM_CHANNEL_ID, CHECK_INTERVAL)
+# ── WebSocket listener ─────────────────────────────────────────────────────────
 
-    send_telegram(
-        f"🤖 *DexScreener ETH DEX PAID Alerts — Live*\n\n"
-        f"Monitoring Ethereum DEX PAID listings every {CHECK_INTERVAL}s\n"
-        f"Using `/token-profiles/latest/v1` endpoint."
-    )
+async def listen():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Origin": "https://dexscreener.com",
+    }
 
-    logger.info("Seeding existing DEX PAID tokens (silent)...")
-    for t in get_dex_paid_eth_tokens():
-        if addr := t.get("tokenAddress"):
-            seen_tokens.add(addr)
-    logger.info("Seeded %d tokens. Watching for NEW DEX PAID listings...", len(seen_tokens))
+    reconnect_delay = 5
 
     while True:
         try:
-            check_and_alert()
+            logger.info("Connecting to DexScreener WebSocket...")
+            async with websockets.connect(WS_URL, additional_headers=headers, ping_interval=30, ping_timeout=10) as ws:
+                logger.info("✅ WebSocket connected — streaming DEX PAID in real time!")
+                reconnect_delay = 5  # reset on success
+
+                async for raw_msg in ws:
+                    try:
+                        msg = json.loads(raw_msg)
+
+                        # WebSocket sends: {"limit": 90, "data": [...tokens]}
+                        data = msg.get("data") or []
+                        if not isinstance(data, list):
+                            # Might be a direct list
+                            data = [msg] if isinstance(msg, dict) and "tokenAddress" in msg else []
+
+                        for token in data:
+                            handle_token(token)
+
+                    except json.JSONDecodeError:
+                        logger.warning("Non-JSON message: %s", raw_msg[:100])
+                    except Exception as e:
+                        logger.error("Error handling message: %s", e)
+
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning("WebSocket closed: %s — reconnecting in %ds", e, reconnect_delay)
         except Exception as e:
-            logger.exception("Loop error: %s", e)
-        time.sleep(CHECK_INTERVAL)
+            logger.error("WebSocket error: %s — reconnecting in %ds", e, reconnect_delay)
+
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, 60)  # exponential backoff, max 60s
+
+
+# ── Seed existing tokens (no alerts) ──────────────────────────────────────────
+
+def seed_existing_tokens():
+    logger.info("Seeding existing DEX PAID tokens silently...")
+    try:
+        resp = requests.get(
+            "https://api.dexscreener.com/token-profiles/latest/v1",
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        tokens = data if isinstance(data, list) else data.get("data", [])
+        for t in tokens:
+            addr = t.get("tokenAddress", "")
+            if addr:
+                seen_tokens.add(addr)
+        logger.info("Seeded %d tokens. Only NEW ones will trigger alerts.", len(seen_tokens))
+    except Exception as e:
+        logger.error("Seed failed: %s", e)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+async def main():
+    logger.info("Starting DexScreener ETH DEX PAID WebSocket Bot")
+    logger.info("Channel: %s", TELEGRAM_CHANNEL_ID)
+
+    send_telegram(
+        "🤖 *DexScreener ETH DEX PAID — WebSocket Mode*\n\n"
+        "Connected to DexScreener real-time stream.\n"
+        "Alerts fire instantly when new ETH tokens get DEX PAID ✅"
+    )
+
+    seed_existing_tokens()
+    await listen()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

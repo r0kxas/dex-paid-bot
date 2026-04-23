@@ -15,9 +15,8 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 
-# Both endpoints — latest gives newest, active gives all currently running boosts
-BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
-BOOSTS_ACTIVE_URL = "https://api.dexscreener.com/token-boosts/active/v1"
+# DEX PAID endpoint (token profiles = the green PAID badge)
+DEX_PAID_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 PAIRS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
@@ -42,52 +41,47 @@ class RateLimiter:
         self.calls.append(time.monotonic())
 
 
-boosts_limiter = RateLimiter(max_calls=48, period=60)
+profiles_limiter = RateLimiter(max_calls=48, period=60)
 pairs_limiter = RateLimiter(max_calls=240, period=60)
 
 
-def fetch_boosts(url: str) -> list[dict]:
-    boosts_limiter.wait()
+def get_dex_paid_eth_tokens() -> list[dict]:
+    profiles_limiter.wait()
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(
+            DEX_PAID_URL, timeout=15,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        )
         resp.raise_for_status()
         data = resp.json()
+
         if isinstance(data, list):
-            return data
+            all_tokens = data
         elif isinstance(data, dict):
-            return data.get("data") or data.get("tokens") or []
-        return []
+            all_tokens = data.get("data") or data.get("tokens") or []
+        else:
+            logger.warning("Unexpected format: %s", type(data))
+            return []
+
+        chains = {t.get("chainId", "") for t in all_tokens}
+        logger.info("DEX PAID: %d tokens across chains: %s", len(all_tokens), chains)
+
+        eth = [t for t in all_tokens if str(t.get("chainId", "")).lower() in ETH_CHAIN_IDS]
+        logger.info("ETH DEX PAID tokens: %d", len(eth))
+        return eth
+
     except Exception as e:
-        logger.error("Error fetching %s: %s", url, e)
+        logger.error("Error fetching DEX PAID: %s", e)
         return []
-
-
-def get_paid_eth_tokens() -> list[dict]:
-    """Fetch from both latest and active endpoints, deduplicate."""
-    latest = fetch_boosts(BOOSTS_LATEST_URL)
-    active = fetch_boosts(BOOSTS_ACTIVE_URL)
-
-    # Merge, deduplicate by tokenAddress
-    all_tokens: dict[str, dict] = {}
-    for t in active + latest:  # latest overwrites active so newest data wins
-        addr = t.get("tokenAddress", "")
-        if addr:
-            all_tokens[addr] = t
-
-    all_list = list(all_tokens.values())
-    chains = {t.get("chainId", "") for t in all_list}
-    logger.info("Combined: %d unique tokens across chains: %s", len(all_list), chains)
-
-    eth = [t for t in all_list if str(t.get("chainId", "")).lower() in ETH_CHAIN_IDS]
-    logger.info("ETH paid tokens: %d", len(eth))
-    return eth
 
 
 def get_token_market_data(token_address: str) -> dict:
     pairs_limiter.wait()
     try:
-        resp = requests.get(PAIRS_URL.format(token_address), timeout=10,
-                            headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(
+            PAIRS_URL.format(token_address), timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
         if not pairs:
@@ -170,12 +164,12 @@ def format_alert(token: dict, market: dict) -> str:
         if lt == "telegram" and not tg:   tg   = lu
 
     lines = [
-        f"🔥 *{name} | {sym}* (ethereum)",
+        f"✅ *{name} | {sym}* (ethereum)",
         f"`{addr}`",
         "",
         "⏰ *DEX Time*",
         f"└ {dex} • {listed}",
-        f"└ [DexScreener]({ds_url}) 🟢 *PAID*",
+        f"└ [DexScreener]({ds_url}) ✅ *DEX PAID*",
         "",
     ]
 
@@ -225,7 +219,7 @@ def send_telegram(text: str) -> bool:
 
 
 def check_and_alert():
-    tokens = get_paid_eth_tokens()
+    tokens = get_dex_paid_eth_tokens()
     new_count = 0
 
     for token in tokens:
@@ -252,17 +246,16 @@ def main():
     logger.info("Starting | channel=%s interval=%ds", TELEGRAM_CHANNEL_ID, CHECK_INTERVAL)
 
     send_telegram(
-        f"🤖 *DexScreener ETH Paid Alerts — Live*\n\n"
-        f"Monitoring Ethereum paid listings every {CHECK_INTERVAL}s\n"
-        f"Watching both `/latest` and `/active` boost endpoints."
+        f"🤖 *DexScreener ETH DEX PAID Alerts — Live*\n\n"
+        f"Monitoring Ethereum DEX PAID listings every {CHECK_INTERVAL}s\n"
+        f"Using `/token-profiles/latest/v1` endpoint."
     )
 
-    # Seed silently — no alerts for already-active boosts
-    logger.info("Seeding existing tokens (silent)...")
-    for t in get_paid_eth_tokens():
+    logger.info("Seeding existing DEX PAID tokens (silent)...")
+    for t in get_dex_paid_eth_tokens():
         if addr := t.get("tokenAddress"):
             seen_tokens.add(addr)
-    logger.info("Seeded %d tokens. Watching for NEW listings...", len(seen_tokens))
+    logger.info("Seeded %d tokens. Watching for NEW DEX PAID listings...", len(seen_tokens))
 
     while True:
         try:

@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 import json
-import time
 import requests
 import websockets
 from datetime import datetime, timezone
@@ -16,13 +15,20 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-# Official DexScreener WebSocket — real-time token profiles (DEX PAID)
-WS_URL   = "wss://api.dexscreener.com/token-profiles/latest/v1"
-PAIRS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+# Both WebSocket endpoints — run simultaneously
+WS_LATEST_URL  = "wss://api.dexscreener.com/token-profiles/latest/v1"         # new DEX PAIDs
+WS_UPDATES_URL = "wss://api.dexscreener.com/token-profiles/recent-updates/v1"  # social updates
+PAIRS_URL      = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
 
-seen_tokens: set[str] = set()
+# seen_tokens: addr -> last alert timestamp (allows re-alerting if socials update)
+alerted_tokens: dict[str, float] = {}
+
+WS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Origin": "https://dexscreener.com",
+}
 
 
 # ── Market data ────────────────────────────────────────────────────────────────
@@ -78,20 +84,20 @@ def fmt_pct(v) -> str:
 def time_ago(unix_ms) -> str:
     try:
         diff = datetime.now(timezone.utc).timestamp() - (unix_ms / 1000)
-        if diff < 60:   return f"{int(diff)}s ago"
-        if diff < 3600: return f"{int(diff//60)}' {int(diff%60)}s ago"
+        if diff < 60:    return f"{int(diff)}s ago"
+        if diff < 3600:  return f"{int(diff//60)}' {int(diff%60)}s ago"
         h = int(diff // 3600)
         if h < 24*30:   return f"{h}h {int((diff%3600)//60)}m ago"
         days = int(diff // 86400)
         if days < 365:  return f"{days}d ago"
-        return f"{int(days//365)}y ago"
+        return f"{int(days//365)}y {int((days%365)//30)}mo ago"
     except Exception:
         return "recently"
 
 
 # ── Alert formatter ────────────────────────────────────────────────────────────
 
-def format_alert(token: dict, market: dict) -> str:
+def format_alert(token: dict, market: dict, is_update: bool = False) -> str:
     addr   = token.get("tokenAddress", "")
     chain  = token.get("chainId", "ethereum")
     ds_url = token.get("url", f"https://dexscreener.com/{chain}/{addr}")
@@ -114,8 +120,11 @@ def format_alert(token: dict, market: dict) -> str:
         if lt == "twitter"  and not tw:   tw   = lu
         if lt == "telegram" and not tg:   tg   = lu
 
+    header = "🔄 *DEX PAID — Social Update*" if is_update else "✅ *New DEX PAID Listing*"
+
     lines = [
-        f"✅ *{name} | {sym}* (ethereum)",
+        header,
+        f"*{name} | {sym}* (ethereum)",
         f"`{addr}`",
         "",
         "⏰ *DEX Time*",
@@ -130,6 +139,8 @@ def format_alert(token: dict, market: dict) -> str:
     if site: social_rows.append(f"└ [Website]({site})")
     if social_rows:
         lines += ["🔗 *Links*"] + social_rows + [""]
+    else:
+        lines += ["🔗 *Links* — none yet\n"]
 
     lines += [
         "📊 *Market*",
@@ -173,108 +184,105 @@ def send_telegram(text: str) -> bool:
 
 # ── Token handler ──────────────────────────────────────────────────────────────
 
-def handle_token(token: dict):
+def handle_token(token: dict, is_update: bool = False):
     addr  = token.get("tokenAddress", "")
     chain = str(token.get("chainId", "")).lower()
 
     if not addr or chain not in ETH_CHAIN_IDS:
         return
 
-    if addr in seen_tokens:
-        return
+    now = __import__("time").time()
 
-    seen_tokens.add(addr)
-    logger.info("🆕 New ETH DEX PAID: %s", addr)
+    # For updates: only re-alert if we haven't alerted this token in last 10 mins
+    if addr in alerted_tokens:
+        if not is_update:
+            return  # already alerted for new listing
+        if now - alerted_tokens[addr] < 600:
+            return  # too soon for another update alert
+
+    alerted_tokens[addr] = now
+    source = "UPDATE" if is_update else "NEW"
+    logger.info("🆕 ETH DEX PAID [%s]: %s", source, addr)
 
     market  = get_token_market_data(addr)
-    message = format_alert(token, market)
+    message = format_alert(token, market, is_update=is_update)
 
     if send_telegram(message):
-        logger.info("✅ Alert sent: %s", addr)
+        logger.info("✅ Alert sent [%s]: %s", source, addr)
     else:
-        logger.warning("❌ Failed to send alert: %s", addr)
+        logger.warning("❌ Failed [%s]: %s", source, addr)
 
 
 # ── WebSocket listener ─────────────────────────────────────────────────────────
 
-async def listen():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://dexscreener.com",
-    }
-
-    reconnect_delay = 5
-
+async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bool = False):
+    delay = 3
     while True:
         try:
-            logger.info("Connecting to DexScreener WebSocket...")
-            async with websockets.connect(WS_URL, additional_headers=headers, ping_interval=30, ping_timeout=10) as ws:
-                logger.info("✅ WebSocket connected — streaming DEX PAID in real time!")
-                reconnect_delay = 5  # reset on success
+            logger.info("[%s] Connecting to %s ...", label, url)
+            async with websockets.connect(
+                url,
+                additional_headers=WS_HEADERS,
+                ping_interval=20,
+                ping_timeout=10,
+                max_size=10 * 1024 * 1024,
+            ) as ws:
+                logger.info("[%s] ✅ Connected!", label)
+                delay = 3  # reset backoff
 
+                first_msg = True
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
+                        tokens = msg.get("data") or []
 
-                        # WebSocket sends: {"limit": 90, "data": [...tokens]}
-                        data = msg.get("data") or []
-                        if not isinstance(data, list):
-                            # Might be a direct list
-                            data = [msg] if isinstance(msg, dict) and "tokenAddress" in msg else []
+                        if first_msg and seed_on_connect:
+                            # Seed existing tokens silently on first message
+                            first_msg = False
+                            for t in tokens:
+                                addr = t.get("tokenAddress", "")
+                                if addr:
+                                    alerted_tokens[addr] = __import__("time").time()
+                            logger.info("[%s] Seeded %d existing tokens silently", label, len(tokens))
+                            continue
 
-                        for token in data:
-                            handle_token(token)
+                        first_msg = False
+                        for token in tokens:
+                            handle_token(token, is_update=is_update)
 
                     except json.JSONDecodeError:
-                        logger.warning("Non-JSON message: %s", raw_msg[:100])
+                        logger.warning("[%s] Non-JSON: %s", label, str(raw_msg)[:80])
                     except Exception as e:
-                        logger.error("Error handling message: %s", e)
+                        logger.error("[%s] Message error: %s", label, e)
 
         except websockets.exceptions.ConnectionClosed as e:
-            logger.warning("WebSocket closed: %s — reconnecting in %ds", e, reconnect_delay)
+            logger.warning("[%s] Closed: %s — retry in %ds", label, e, delay)
         except Exception as e:
-            logger.error("WebSocket error: %s — reconnecting in %ds", e, reconnect_delay)
+            logger.error("[%s] Error: %s — retry in %ds", label, e, delay)
 
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, 60)  # exponential backoff, max 60s
-
-
-# ── Seed existing tokens (no alerts) ──────────────────────────────────────────
-
-def seed_existing_tokens():
-    logger.info("Seeding existing DEX PAID tokens silently...")
-    try:
-        resp = requests.get(
-            "https://api.dexscreener.com/token-profiles/latest/v1",
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        tokens = data if isinstance(data, list) else data.get("data", [])
-        for t in tokens:
-            addr = t.get("tokenAddress", "")
-            if addr:
-                seen_tokens.add(addr)
-        logger.info("Seeded %d tokens. Only NEW ones will trigger alerts.", len(seen_tokens))
-    except Exception as e:
-        logger.error("Seed failed: %s", e)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 async def main():
-    logger.info("Starting DexScreener ETH DEX PAID WebSocket Bot")
+    logger.info("Starting DexScreener ETH DEX PAID Bot — Dual WebSocket Mode")
     logger.info("Channel: %s", TELEGRAM_CHANNEL_ID)
 
     send_telegram(
-        "🤖 *DexScreener ETH DEX PAID — WebSocket Mode*\n\n"
-        "Connected to DexScreener real-time stream.\n"
-        "Alerts fire instantly when new ETH tokens get DEX PAID ✅"
+        "🤖 *DexScreener ETH DEX PAID — Live*\n\n"
+        "📡 Connected to TWO real-time streams:\n"
+        "• `latest/v1` — new DEX PAID listings\n"
+        "• `recent-updates/v1` — social info updates\n\n"
+        "Alerts fire instantly ✅"
     )
 
-    seed_existing_tokens()
-    await listen()
+    # Run both WebSocket listeners concurrently
+    await asyncio.gather(
+        ws_listener(WS_LATEST_URL,  label="LATEST",  is_update=False, seed_on_connect=True),
+        ws_listener(WS_UPDATES_URL, label="UPDATES", is_update=True,  seed_on_connect=True),
+    )
 
 
 if __name__ == "__main__":

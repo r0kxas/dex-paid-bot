@@ -197,17 +197,8 @@ async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bo
         try:
             logger.info("[%s] Connecting...", label)
 
-            # Use extra_headers (works across all websockets versions)
-            async with websockets.connect(
-                url,
-                extra_headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                    "Origin": "https://dexscreener.com",
-                },
-                ping_interval=20,
-                ping_timeout=10,
-                max_size=10 * 1024 * 1024,
-            ) as ws:
+            # No custom headers — pure simple connect, works on all versions
+            async with websockets.connect(url) as ws:
                 logger.info("[%s] ✅ Connected!", label)
                 delay = 3
                 first_msg = True
@@ -249,10 +240,8 @@ async def main():
 
     send_telegram(
         "🤖 *DexScreener ETH DEX PAID — Live*\n\n"
-        "📡 Connected to real-time streams:\n"
-        "• `latest/v1` — new DEX PAID listings\n"
-        "• `recent-updates/v1` — social updates\n\n"
-        "Alerts fire instantly ✅"
+        "📡 Connecting to real-time streams...\n"
+        "Alerts fire instantly when new ETH tokens get DEX PAID ✅"
     )
 
     await asyncio.gather(

@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-WS_LATEST_URL = "wss://api.dexscreener.com/token-profiles/latest/v1"       # new DEX Paid
-WS_CTO_URL    = "wss://api.dexscreener.com/community-takeovers/latest/v1"  # CTO re-pays
+WS_LATEST_URL = "wss://api.dexscreener.com/token-profiles/latest/v1"
+WS_CTO_URL    = "wss://api.dexscreener.com/community-takeovers/latest/v1"
 PAIRS_URL     = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
@@ -170,14 +170,12 @@ def handle_token(token: dict, is_cto: bool = False):
     if not addr or chain not in ETH_CHAIN_IDS:
         return
 
-    now = time.time()
-
-    # For CTOs: always alert (each CTO is a fresh payment event)
-    # For new: skip if already alerted
-    if not is_cto and addr in alerted_tokens:
+    # Prevent duplicate alerts for same token on same stream
+    key = f"{addr}_{is_cto}"
+    if key in alerted_tokens:
         return
 
-    alerted_tokens[addr] = now
+    alerted_tokens[key] = time.time()
     label = "CTO" if is_cto else "NEW"
     logger.info("🆕 ETH DEX PAID [%s]: %s", label, addr)
 
@@ -190,7 +188,7 @@ def handle_token(token: dict, is_cto: bool = False):
         logger.warning("❌ Failed [%s]: %s", label, addr)
 
 
-async def ws_listener(url: str, label: str, is_cto: bool, seed_on_connect: bool = False):
+async def ws_listener(url: str, label: str, is_cto: bool):
     delay = 3
 
     while True:
@@ -210,16 +208,13 @@ async def ws_listener(url: str, label: str, is_cto: bool, seed_on_connect: bool 
                         else:
                             tokens = msg.get("data") or []
 
-                        if first_msg and seed_on_connect:
+                        # Always skip the first message — it's a history dump of old tokens
+                        if first_msg:
                             first_msg = False
-                            for t in tokens:
-                                addr = t.get("tokenAddress", "")
-                                if addr:
-                                    alerted_tokens[addr] = time.time()
-                            logger.info("[%s] Seeded %d tokens silently", label, len(tokens))
+                            logger.info("[%s] Skipped history dump (%d tokens) — watching for NEW only", label, len(tokens))
                             continue
 
-                        first_msg = False
+                        # All subsequent messages are real-time events
                         for token in tokens:
                             handle_token(token, is_cto=is_cto)
 
@@ -242,15 +237,15 @@ async def main():
 
     send_telegram(
         "🤖 *DexScreener ETH DEX PAID — Live*\n\n"
-        "📡 Monitoring two streams:\n"
+        "📡 Monitoring real-time streams:\n"
         "• ✅ New DEX Paid listings\n"
         "• 🔄 CTO (Community Takeovers)\n\n"
-        "Alerts fire instantly!"
+        "Only showing payments happening RIGHT NOW ⚡"
     )
 
     await asyncio.gather(
-        ws_listener(WS_LATEST_URL, label="NEW", is_cto=False, seed_on_connect=True),
-        ws_listener(WS_CTO_URL,    label="CTO", is_cto=True,  seed_on_connect=True),
+        ws_listener(WS_LATEST_URL, label="NEW", is_cto=False),
+        ws_listener(WS_CTO_URL,    label="CTO", is_cto=True),
     )
 
 

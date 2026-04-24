@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import json
+import time
 import requests
 import websockets
 from datetime import datetime, timezone
@@ -15,30 +16,18 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-# Both WebSocket endpoints — run simultaneously
-WS_LATEST_URL  = "wss://api.dexscreener.com/token-profiles/latest/v1"         # new DEX PAIDs
-WS_UPDATES_URL = "wss://api.dexscreener.com/token-profiles/recent-updates/v1"  # social updates
+WS_LATEST_URL  = "wss://api.dexscreener.com/token-profiles/latest/v1"
+WS_UPDATES_URL = "wss://api.dexscreener.com/token-profiles/recent-updates/v1"
 PAIRS_URL      = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
-
-# seen_tokens: addr -> last alert timestamp (allows re-alerting if socials update)
 alerted_tokens: dict[str, float] = {}
 
-WS_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Origin": "https://dexscreener.com",
-}
-
-
-# ── Market data ────────────────────────────────────────────────────────────────
 
 def get_token_market_data(token_address: str) -> dict:
     try:
-        resp = requests.get(
-            PAIRS_URL.format(token_address), timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
+        resp = requests.get(PAIRS_URL.format(token_address), timeout=10,
+                            headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
         if not pairs:
@@ -48,8 +37,6 @@ def get_token_market_data(token_address: str) -> dict:
         logger.warning("Market data failed for %s: %s", token_address, e)
         return {}
 
-
-# ── Formatters ─────────────────────────────────────────────────────────────────
 
 def fmt_number(value) -> str:
     try:
@@ -84,18 +71,16 @@ def fmt_pct(v) -> str:
 def time_ago(unix_ms) -> str:
     try:
         diff = datetime.now(timezone.utc).timestamp() - (unix_ms / 1000)
-        if diff < 60:    return f"{int(diff)}s ago"
-        if diff < 3600:  return f"{int(diff//60)}' {int(diff%60)}s ago"
+        if diff < 60:   return f"{int(diff)}s ago"
+        if diff < 3600: return f"{int(diff//60)}' {int(diff%60)}s ago"
         h = int(diff // 3600)
-        if h < 24*30:   return f"{h}h {int((diff%3600)//60)}m ago"
+        if h < 720:     return f"{h}h {int((diff%3600)//60)}m ago"
         days = int(diff // 86400)
         if days < 365:  return f"{days}d ago"
         return f"{int(days//365)}y {int((days%365)//30)}mo ago"
     except Exception:
         return "recently"
 
-
-# ── Alert formatter ────────────────────────────────────────────────────────────
 
 def format_alert(token: dict, market: dict, is_update: bool = False) -> str:
     addr   = token.get("tokenAddress", "")
@@ -139,8 +124,6 @@ def format_alert(token: dict, market: dict, is_update: bool = False) -> str:
     if site: social_rows.append(f"└ [Website]({site})")
     if social_rows:
         lines += ["🔗 *Links*"] + social_rows + [""]
-    else:
-        lines += ["🔗 *Links* — none yet\n"]
 
     lines += [
         "📊 *Market*",
@@ -158,8 +141,6 @@ def format_alert(token: dict, market: dict, is_update: bool = False) -> str:
 
     return "\n".join(lines)
 
-
-# ── Telegram ───────────────────────────────────────────────────────────────────
 
 def send_telegram(text: str) -> bool:
     try:
@@ -182,8 +163,6 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-# ── Token handler ──────────────────────────────────────────────────────────────
-
 def handle_token(token: dict, is_update: bool = False):
     addr  = token.get("tokenAddress", "")
     chain = str(token.get("chainId", "")).lower()
@@ -191,59 +170,60 @@ def handle_token(token: dict, is_update: bool = False):
     if not addr or chain not in ETH_CHAIN_IDS:
         return
 
-    now = __import__("time").time()
-
-    # For updates: only re-alert if we haven't alerted this token in last 10 mins
+    now = time.time()
     if addr in alerted_tokens:
         if not is_update:
-            return  # already alerted for new listing
+            return
         if now - alerted_tokens[addr] < 600:
-            return  # too soon for another update alert
+            return
 
     alerted_tokens[addr] = now
-    source = "UPDATE" if is_update else "NEW"
-    logger.info("🆕 ETH DEX PAID [%s]: %s", source, addr)
+    logger.info("🆕 ETH DEX PAID [%s]: %s", "UPDATE" if is_update else "NEW", addr)
 
     market  = get_token_market_data(addr)
     message = format_alert(token, market, is_update=is_update)
 
     if send_telegram(message):
-        logger.info("✅ Alert sent [%s]: %s", source, addr)
+        logger.info("✅ Alert sent: %s", addr)
     else:
-        logger.warning("❌ Failed [%s]: %s", source, addr)
+        logger.warning("❌ Failed: %s", addr)
 
-
-# ── WebSocket listener ─────────────────────────────────────────────────────────
 
 async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bool = False):
     delay = 3
+    first_msg = True
+
     while True:
         try:
-            logger.info("[%s] Connecting to %s ...", label, url)
+            logger.info("[%s] Connecting...", label)
+
+            # Use extra_headers (works across all websockets versions)
             async with websockets.connect(
                 url,
-                additional_headers=WS_HEADERS,
+                extra_headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                    "Origin": "https://dexscreener.com",
+                },
                 ping_interval=20,
                 ping_timeout=10,
                 max_size=10 * 1024 * 1024,
             ) as ws:
                 logger.info("[%s] ✅ Connected!", label)
-                delay = 3  # reset backoff
-
+                delay = 3
                 first_msg = True
+
                 async for raw_msg in ws:
                     try:
-                        msg = json.loads(raw_msg)
+                        msg    = json.loads(raw_msg)
                         tokens = msg.get("data") or []
 
                         if first_msg and seed_on_connect:
-                            # Seed existing tokens silently on first message
                             first_msg = False
                             for t in tokens:
                                 addr = t.get("tokenAddress", "")
                                 if addr:
-                                    alerted_tokens[addr] = __import__("time").time()
-                            logger.info("[%s] Seeded %d existing tokens silently", label, len(tokens))
+                                    alerted_tokens[addr] = time.time()
+                            logger.info("[%s] Seeded %d tokens silently", label, len(tokens))
                             continue
 
                         first_msg = False
@@ -264,21 +244,17 @@ async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bo
         delay = min(delay * 2, 60)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-
 async def main():
-    logger.info("Starting DexScreener ETH DEX PAID Bot — Dual WebSocket Mode")
-    logger.info("Channel: %s", TELEGRAM_CHANNEL_ID)
+    logger.info("Starting | channel=%s", TELEGRAM_CHANNEL_ID)
 
     send_telegram(
         "🤖 *DexScreener ETH DEX PAID — Live*\n\n"
-        "📡 Connected to TWO real-time streams:\n"
+        "📡 Connected to real-time streams:\n"
         "• `latest/v1` — new DEX PAID listings\n"
-        "• `recent-updates/v1` — social info updates\n\n"
+        "• `recent-updates/v1` — social updates\n\n"
         "Alerts fire instantly ✅"
     )
 
-    # Run both WebSocket listeners concurrently
     await asyncio.gather(
         ws_listener(WS_LATEST_URL,  label="LATEST",  is_update=False, seed_on_connect=True),
         ws_listener(WS_UPDATES_URL, label="UPDATES", is_update=True,  seed_on_connect=True),

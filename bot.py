@@ -206,7 +206,11 @@ async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bo
                 async for raw_msg in ws:
                     try:
                         msg    = json.loads(raw_msg)
-                        tokens = msg.get("data") or []
+                        # Some endpoints return {"data": [...]} others return [...] directly
+                        if isinstance(msg, list):
+                            tokens = msg
+                        else:
+                            tokens = msg.get("data") or []
 
                         if first_msg and seed_on_connect:
                             first_msg = False

@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-WS_LATEST_URL  = "wss://api.dexscreener.com/token-profiles/latest/v1"
-WS_UPDATES_URL = "wss://api.dexscreener.com/token-profiles/recent-updates/v1"
-PAIRS_URL      = "https://api.dexscreener.com/latest/dex/tokens/{}"
+WS_LATEST_URL = "wss://api.dexscreener.com/token-profiles/latest/v1"       # new DEX Paid
+WS_CTO_URL    = "wss://api.dexscreener.com/community-takeovers/latest/v1"  # CTO re-pays
+PAIRS_URL     = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 ETH_CHAIN_IDS = {"ethereum", "eth", "1"}
 alerted_tokens: dict[str, float] = {}
@@ -82,7 +82,7 @@ def time_ago(unix_ms) -> str:
         return "recently"
 
 
-def format_alert(token: dict, market: dict, is_update: bool = False) -> str:
+def format_alert(token: dict, market: dict, is_cto: bool = False) -> str:
     addr   = token.get("tokenAddress", "")
     chain  = token.get("chainId", "ethereum")
     ds_url = token.get("url", f"https://dexscreener.com/{chain}/{addr}")
@@ -105,7 +105,7 @@ def format_alert(token: dict, market: dict, is_update: bool = False) -> str:
         if lt == "twitter"  and not tw:   tw   = lu
         if lt == "telegram" and not tg:   tg   = lu
 
-    header = "🔄 *DEX PAID — Social Update*" if is_update else "✅ *New DEX PAID Listing*"
+    header = "🔄 *CTO — Community Takeover*" if is_cto else "✅ *New DEX PAID Listing*"
 
     lines = [
         header,
@@ -163,7 +163,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def handle_token(token: dict, is_update: bool = False):
+def handle_token(token: dict, is_cto: bool = False):
     addr  = token.get("tokenAddress", "")
     chain = str(token.get("chainId", "")).lower()
 
@@ -171,33 +171,31 @@ def handle_token(token: dict, is_update: bool = False):
         return
 
     now = time.time()
-    if addr in alerted_tokens:
-        if not is_update:
-            return
-        if now - alerted_tokens[addr] < 600:
-            return
+
+    # For CTOs: always alert (each CTO is a fresh payment event)
+    # For new: skip if already alerted
+    if not is_cto and addr in alerted_tokens:
+        return
 
     alerted_tokens[addr] = now
-    logger.info("🆕 ETH DEX PAID [%s]: %s", "UPDATE" if is_update else "NEW", addr)
+    label = "CTO" if is_cto else "NEW"
+    logger.info("🆕 ETH DEX PAID [%s]: %s", label, addr)
 
     market  = get_token_market_data(addr)
-    message = format_alert(token, market, is_update=is_update)
+    message = format_alert(token, market, is_cto=is_cto)
 
     if send_telegram(message):
-        logger.info("✅ Alert sent: %s", addr)
+        logger.info("✅ Alert sent [%s]: %s", label, addr)
     else:
-        logger.warning("❌ Failed: %s", addr)
+        logger.warning("❌ Failed [%s]: %s", label, addr)
 
 
-async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bool = False):
+async def ws_listener(url: str, label: str, is_cto: bool, seed_on_connect: bool = False):
     delay = 3
-    first_msg = True
 
     while True:
         try:
             logger.info("[%s] Connecting...", label)
-
-            # No custom headers — pure simple connect, works on all versions
             async with websockets.connect(url) as ws:
                 logger.info("[%s] ✅ Connected!", label)
                 delay = 3
@@ -205,8 +203,8 @@ async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bo
 
                 async for raw_msg in ws:
                     try:
-                        msg    = json.loads(raw_msg)
-                        # Some endpoints return {"data": [...]} others return [...] directly
+                        msg = json.loads(raw_msg)
+
                         if isinstance(msg, list):
                             tokens = msg
                         else:
@@ -223,7 +221,7 @@ async def ws_listener(url: str, label: str, is_update: bool, seed_on_connect: bo
 
                         first_msg = False
                         for token in tokens:
-                            handle_token(token, is_update=is_update)
+                            handle_token(token, is_cto=is_cto)
 
                     except json.JSONDecodeError:
                         logger.warning("[%s] Non-JSON: %s", label, str(raw_msg)[:80])
@@ -244,13 +242,15 @@ async def main():
 
     send_telegram(
         "🤖 *DexScreener ETH DEX PAID — Live*\n\n"
-        "📡 Connecting to real-time streams...\n"
-        "Alerts fire instantly when new ETH tokens get DEX PAID ✅"
+        "📡 Monitoring two streams:\n"
+        "• ✅ New DEX Paid listings\n"
+        "• 🔄 CTO (Community Takeovers)\n\n"
+        "Alerts fire instantly!"
     )
 
     await asyncio.gather(
-        ws_listener(WS_LATEST_URL,  label="LATEST",  is_update=False, seed_on_connect=True),
-        ws_listener(WS_UPDATES_URL, label="UPDATES", is_update=True,  seed_on_connect=True),
+        ws_listener(WS_LATEST_URL, label="NEW", is_cto=False, seed_on_connect=True),
+        ws_listener(WS_CTO_URL,    label="CTO", is_cto=True,  seed_on_connect=True),
     )
 
 
